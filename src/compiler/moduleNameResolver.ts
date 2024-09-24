@@ -636,8 +636,7 @@ export function resolveTypeReferenceDirective(typeReferenceDirectiveName: string
         resolutionDiagnostics: initializeResolutionField(diagnostics),
     };
     if (containingDirectory) {
-        setPerDirectoryAndNonRelativeNameCacheResult(
-            cache,
+        cache?.setPerDirectoryAndNonRelativeNameCacheResult(
             typeReferenceDirectiveName,
             resolutionMode,
             containingDirectory,
@@ -1363,6 +1362,14 @@ function createNonRelativeNameResolutionCache<T>(
 export interface ModuleOrTypeReferenceResolutionCache<T> extends PerDirectoryResolutionCache<T>, NonRelativeNameResolutionCache<T>, PackageJsonInfoCache {
     getPackageJsonInfoCache(): PackageJsonInfoCache;
     compact(availableOptions?: Set<CompilerOptions>, skipOptionsToRedirectsKeyCleanup?: boolean): void;
+    setPerDirectoryAndNonRelativeNameCacheResult(
+        name: string,
+        mode: ResolutionMode,
+        directoryName: string,
+        redirectedReference: ResolvedProjectReference | undefined,
+        result: T,
+    ): void;
+    options: () => CompilerOptions;
     optionsToRedirectsKey: Map<CompilerOptions, RedirectsCacheKey>;
     print(): void;
 }
@@ -1394,17 +1401,20 @@ function createModuleOrTypeReferenceResolutionCache<T>(
     );
     packageJsonInfoCache ??= createPackageJsonInfoCache(currentDirectory, getCanonicalFileName);
 
-    return {
+    const cache: ModuleOrTypeReferenceResolutionCache<T> = {
         ...packageJsonInfoCache,
         ...perDirectoryResolutionCache,
         ...nonRelativeNameResolutionCache,
         clear,
         update,
         compact,
+        setPerDirectoryAndNonRelativeNameCacheResult,
+        options: () => options!,
         getPackageJsonInfoCache: () => packageJsonInfoCache,
         optionsToRedirectsKey,
         print,
     };
+    return cache;
 
     function clear() {
         perDirectoryResolutionCache.clear();
@@ -1412,9 +1422,10 @@ function createModuleOrTypeReferenceResolutionCache<T>(
         packageJsonInfoCache!.clear();
     }
 
-    function update(options: CompilerOptions) {
-        perDirectoryResolutionCache.update(options);
-        nonRelativeNameResolutionCache.update(options);
+    function update(updatedOptions: CompilerOptions) {
+        options = updatedOptions;
+        perDirectoryResolutionCache.update(updatedOptions);
+        nonRelativeNameResolutionCache.update(updatedOptions);
     }
 
     function compact(availableOptions = new Set(optionsToRedirectsKey!.keys()), skipOptionsToRedirectsKeyCleanup?: boolean) {
@@ -1426,6 +1437,21 @@ function createModuleOrTypeReferenceResolutionCache<T>(
                     if (!availableOptions.has(options)) optionsToRedirectsKey!.delete(options);
                 },
             );
+        }
+    }
+
+    function setPerDirectoryAndNonRelativeNameCacheResult(
+        name: string,
+        mode: ResolutionMode,
+        directoryName: string,
+        redirectedReference: ResolvedProjectReference | undefined,
+        result: T,
+    ): void {
+        if (cache.isReadonly) return;
+        cache.getOrCreateCacheForDirectory(directoryName, redirectedReference).set(name, mode, result);
+        if (!isExternalModuleNameRelative(name)) {
+            // put result in per-module name cache
+            cache.getOrCreateCacheForNonRelativeName(name, mode, redirectedReference).set(directoryName, result);
         }
     }
 
@@ -1448,24 +1474,6 @@ function createModuleOrTypeReferenceResolutionCache<T>(
                 console.log(`      ${key} ${JSON.stringify(value, undefined, " ")}`);
             });
         });
-    }
-}
-
-/** @internal */
-export function setPerDirectoryAndNonRelativeNameCacheResult<T>(
-    cache: ModuleOrTypeReferenceResolutionCache<T> | undefined,
-    name: string,
-    mode: ResolutionMode,
-    directoryName: string,
-    redirectedReference: ResolvedProjectReference | undefined,
-    result: T,
-): void {
-    if (cache && !cache.isReadonly) {
-        cache.getOrCreateCacheForDirectory(directoryName, redirectedReference).set(name, mode, result);
-        if (!isExternalModuleNameRelative(name)) {
-            // put result in per-module name cache
-            cache.getOrCreateCacheForNonRelativeName(name, mode, redirectedReference).set(directoryName, result);
-        }
     }
 }
 
@@ -1544,8 +1552,8 @@ export function createTypeReferenceDirectiveResolutionCache(
 }
 
 /** @internal */
-export function getOptionsForLibraryResolution(options: CompilerOptions): CompilerOptions {
-    return { moduleResolution: ModuleResolutionKind.Node10, traceResolution: options.traceResolution };
+export function getOptionsForLibraryResolution(options: CompilerOptions | undefined): CompilerOptions {
+    return { moduleResolution: ModuleResolutionKind.Node10, traceResolution: options?.traceResolution };
 }
 
 /** @internal */
@@ -1611,8 +1619,7 @@ export function resolveModuleName(moduleName: string, containingFile: string, co
                 return Debug.fail(`Unexpected moduleResolution: ${moduleResolution}`);
         }
 
-        setPerDirectoryAndNonRelativeNameCacheResult(
-            cache,
+        cache?.setPerDirectoryAndNonRelativeNameCacheResult(
             moduleName,
             resolutionMode,
             containingDirectory,
@@ -2379,16 +2386,20 @@ export function getEntrypointsFromPackageJsonInfo(
     host: GetPackageJsonEntrypointsHost,
     cache: ModuleResolutionCache | undefined,
     resolveJs?: boolean,
-): string[] | false {
-    if (!resolveJs && packageJsonInfo.contents.resolvedEntrypoints !== undefined) {
+): readonly string[] | undefined {
+    // Since package.json is shared among projects, cache based on options
+    const features = getNodeResolutionFeatures(options);
+    const cachedValue = !resolveJs ?
+        packageJsonInfo.contents.resolvedEntrypoints?.get(features) :
+        undefined;
+    if (cachedValue !== undefined) {
         // Cached value excludes resolutions to JS files - those could be
         // cached separately, but they're used rarely.
-        return packageJsonInfo.contents.resolvedEntrypoints;
+        return cachedValue || undefined;
     }
 
     let entrypoints: string[] | undefined;
     const extensions = Extensions.TypeScript | Extensions.Declaration | (resolveJs ? Extensions.JavaScript : 0);
-    const features = getNodeResolutionFeatures(options);
     const loadPackageJsonMainState = getTemporaryModuleResolutionState(cache?.getPackageJsonInfoCache(), host, options);
     loadPackageJsonMainState.conditions = getConditions(options);
     loadPackageJsonMainState.requestContainingDirectory = packageJsonInfo.packageDirectory;
@@ -2422,8 +2433,8 @@ export function getEntrypointsFromPackageJsonInfo(
             }
         }
     }
-
-    return packageJsonInfo.contents.resolvedEntrypoints = entrypoints || false;
+    (packageJsonInfo.contents.resolvedEntrypoints ??= new Map()).set(features, entrypoints || false);
+    return entrypoints;
 }
 
 function loadEntrypointsFromExportMap(
@@ -2535,7 +2546,7 @@ export interface PackageJsonInfoContents {
     /** false: versionPaths are not present. undefined: not yet resolved */
     versionPaths: VersionPaths | false | undefined;
     /** false: resolved to nothing. undefined: not yet resolved */
-    resolvedEntrypoints: string[] | false | undefined;
+    resolvedEntrypoints: Map<NodeResolutionFeatures, string[] | false> | undefined;
     /** false: peerDependencies are not present. undefined: not yet resolved */
     peerDependencies: string | false | undefined;
 }
